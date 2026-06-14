@@ -1,8 +1,10 @@
 import asyncio
 import io
+import json
 import os
 import re
 import traceback
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -48,6 +50,37 @@ _POLL_MAX_ERRORS = 5       # stop after 5 consecutive fetch failures
 
 _active_polls: dict[str, asyncio.Task] = {}  # key → background task
 _last_dasher_loc: dict[str, tuple[float, float]] = {}  # key → last known (lat, lng)
+
+_POLLS_STATE_FILE = Path(__file__).resolve().parent / "config" / "active_polls.json"
+
+
+def _read_poll_state() -> dict:
+    try:
+        return json.loads(_POLLS_STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _write_poll_state(state: dict) -> None:
+    try:
+        _POLLS_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _POLLS_STATE_FILE.write_text(json.dumps(state, indent=2))
+    except Exception as exc:
+        print(f"[track persist] failed to write state: {exc}")
+
+
+def _persist_poll(key: str, link_type: str, channel_id: int, message_id: int) -> None:
+    state = _read_poll_state()
+    state[key] = {"link_type": link_type, "channel_id": channel_id, "message_id": message_id}
+    _write_poll_state(state)
+
+
+def _unpersist_poll(key: str) -> None:
+    state = _read_poll_state()
+    if key in state:
+        state.pop(key)
+        _write_poll_state(state)
+
 
 LOG_CHANNEL_ID = 1508897324255154216
 
@@ -170,11 +203,13 @@ async def _poll_tracking(link_type: str, key: str, message: discord.Message) -> 
 
     _active_polls.pop(key, None)
     _last_dasher_loc.pop(key, None)
+    _unpersist_poll(key)
 
 
 def _start_poll(link_type: str, key: str, message: discord.Message) -> None:
     if key in _active_polls:
         _active_polls[key].cancel()
+    _persist_poll(key, link_type, message.channel.id, message.id)
     task = asyncio.create_task(_poll_tracking(link_type, key, message))
     _active_polls[key] = task
 
@@ -187,10 +222,29 @@ async def setup_hook():
 bot.setup_hook = setup_hook
 
 
+async def _restore_polls() -> None:
+    state = _read_poll_state()
+    if not state:
+        return
+    print(f"[track restore] restoring {len(state)} active poll(s)...")
+    for key, info in list(state.items()):
+        try:
+            channel = bot.get_channel(info["channel_id"])
+            if channel is None:
+                channel = await bot.fetch_channel(info["channel_id"])
+            message = await channel.fetch_message(info["message_id"])
+            _start_poll(info["link_type"], key, message)
+            print(f"[track restore] resumed {info['link_type']} poll for {key}")
+        except Exception as exc:
+            print(f"[track restore] failed to resume poll for {key}: {exc}")
+            _unpersist_poll(key)
+
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print("------")
+    await _restore_polls()
 
 
 def _preparing_file() -> discord.File:
