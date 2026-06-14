@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import inspect, discord; print\\(inspect.signature\\(discord.ui.Separator.__init__\\)\\)\")",
+      "mcp__visualize__read_me",
+      "mcp__visualize__show_widget",
+      "Bash(Get-Item map_b64.txt)",
+      "Bash(echo \"Done, size: $\\(Get-Item map_b64.txt)",
+      "Bash(start \"C:\\\\Users\\\\jason\\\\Documents\\\\Canary bot\\\\tracking_map_preview.png\")"
+    ]
+  }
+}

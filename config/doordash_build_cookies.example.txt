@@ -1,0 +1,6 @@
+# Build-account cookies (designated cart builder).
+# Copy from DevTools → Network → addCartItem → Cookie header.
+# Gitignored — do not commit.
+
+ddweb_token=...
+cf_clearance=...

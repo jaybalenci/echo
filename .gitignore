@@ -1,0 +1,7 @@
+.env
+config/doordash_cookies.txt
+config/doordash_build_cookies.txt
+__pycache__/
+*.py[cod]
+.venv/
+venv/

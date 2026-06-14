@@ -1,0 +1,11 @@
+# Paste your DoorDash cookie string here (one line, semicolon-separated).
+# Copy from browser DevTools → Network → groupCart request → Cookie header.
+# Do not commit the real file — config/doordash_cookies.txt is gitignored.
+#
+# Required: ddweb_token, cf_clearance (IP-bound — use DOORDASH_PROXY if requests
+# leave a different IP than your browser).
+# Optional: csrf_token (script generates one if missing; cookie + x-csrftoken must match).
+
+dd_device_id=...
+ddweb_token=...
+cf_clearance=...
