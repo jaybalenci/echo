@@ -228,19 +228,20 @@ bot.setup_hook = setup_hook
 
 async def _restore_polls() -> None:
     state = _read_poll_state()
-    if not state:
+    to_restore = [key for key in state if key not in _active_polls]
+    if not to_restore:
         return
-    print(f"[track restore] restoring {len(state)} active poll(s)...")
-    for key, info in list(state.items()):
+    print(f"[track restore] restoring {len(to_restore)} poll(s)...")
+    for key in to_restore:
+        info = state[key]
         try:
-            channel = bot.get_channel(info["channel_id"])
-            if channel is None:
-                channel = await bot.fetch_channel(info["channel_id"])
-            message = await channel.fetch_message(info["message_id"])
+            # Use partial objects — no channel fetch needed, bot edits via its token
+            channel = bot.get_partial_messageable(info["channel_id"])
+            message = channel.get_partial_message(info["message_id"])
             _start_poll(info["link_type"], key, message)
             print(f"[track restore] resumed {info['link_type']} poll for {key}")
         except Exception as exc:
-            print(f"[track restore] failed to resume poll for {key}: {exc}")
+            print(f"[track restore] failed for {key}: {exc}")
             _unpersist_poll(key)
 
 
