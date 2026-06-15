@@ -135,18 +135,22 @@ async def _make_tracking_message(
         delivery_lng = details.get("delivery_lng")
 
         status_code = details.get("status_code")
-        if store_lat is not None and store_lng is not None and delivery_lat is not None and delivery_lng is not None and status_code not in _TERMINAL_STATUSES:
+        if (
+            store_lat is not None and store_lng is not None
+            and delivery_lat is not None and delivery_lng is not None
+            and status_code not in _TERMINAL_STATUSES
+            and details.get("dasher_name")  # don't show map until dasher is assigned
+        ):
             dasher_lat = dasher_lng = None
-            if details.get("dasher_name"):
-                if fetch_loc:
-                    loc = await asyncio.to_thread(fetch_dasher_location, key)
-                    if loc:
-                        _last_dasher_loc[key] = loc
-                cached = _last_dasher_loc.get(key)
-                if cached:
-                    dasher_lat, dasher_lng = cached
+            if fetch_loc:
+                loc = await asyncio.to_thread(fetch_dasher_location, key)
+                if loc:
+                    _last_dasher_loc[key] = loc
+            cached = _last_dasher_loc.get(key)
+            if cached:
+                dasher_lat, dasher_lng = cached
 
-            picked_up = details.get("status_code") == "en_route"
+            picked_up = status_code == "en_route"
             try:
                 map_png = await asyncio.to_thread(
                     generate_tracking_map,
