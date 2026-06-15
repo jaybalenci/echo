@@ -91,6 +91,7 @@ def join_group_order(
         found = _cart_id_from_url(last_url)
         if found:
             resolved_uuid = found
+            break  # one successful redirect is enough; skip remaining invite URLs
 
     # If we followed all invite URLs and landed somewhere that has no cart UUID,
     # DoorDash redirected us away — the link is inactive or expired.
@@ -106,7 +107,8 @@ def join_group_order(
     vlog("group", f"cart UUID: {query_cart_id}")
     log("group", "fetching cart items...")
     referer = group_cart_referer(query_cart_id)
-    client.warm(referer)
+    # The redirect above already visited doordash.com/cart/{uuid}/ and set session
+    # cookies (including csrf_token) via merge_session_cookies — no separate warm needed.
     client.csrf = resolve_csrf(client.cookies)
     client.cookies["csrf_token"] = client.csrf
 
