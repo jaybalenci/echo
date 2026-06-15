@@ -98,11 +98,13 @@ def run_price_order(
             # Phase 2: rebuild cart + set delivery address at the same time.
             # set_delivery_address only updates the account's default address (no cart
             # knowledge needed), so pre_client can handle it while rebuild runs.
+            # Pass warmed cookies (CSRF already set) so rebuild skips its own warm.
             log("price", f"phase 2: building cart ({len(specs)} items)...")
+            warmed_cookies = dict(pre_client.cookies)
             with ThreadPoolExecutor(max_workers=2) as pool:
                 f_rebuild = pool.submit(
                     rebuild_cart,
-                    specs, restaurant, menu_id, cookies,
+                    specs, restaurant, menu_id, warmed_cookies,
                     on_item_added=on_item_added,
                     on_status=on_status,
                 )
@@ -112,7 +114,19 @@ def run_price_order(
                     referer="https://www.doordash.com/",
                 )
 
-            rebuilt, failures, client, built_cart_id = f_rebuild.result()
+            try:
+                rebuilt, failures, client, built_cart_id = f_rebuild.result()
+            except RequestException as exc:
+                exc_str = str(exc)
+                if "timed out" in exc_str.lower() or "curl: (28)" in exc_str:
+                    log("price", f"rebuild timed out (account {idx + 1}), retrying...")
+                    tried.add(idx)
+                    continue
+                if "403" in exc_str:
+                    log("price", f"rebuild blocked 403 (account {idx + 1}), retrying...")
+                    tried.add(idx)
+                    continue
+                raise
             try:
                 address_result = f_address.result()
             except RequestException as exc:

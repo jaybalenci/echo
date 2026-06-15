@@ -17,6 +17,7 @@ from doordash.web_client import (
     add_cart_item,
     list_detailed_carts,
     remove_cart_item,
+    resolve_csrf,
     store_referer,
 )
 
@@ -84,7 +85,11 @@ def rebuild_cart(
 
     referer = store_referer(restaurant, menu_id)
     client = DoorDashWebSession(build_cookies)
-    client.warm(referer)
+    # build_cookies come from the already-warmed pre_client (Phase 1), so they
+    # carry a valid CSRF token. Skip the store-page warm to avoid a redundant
+    # HTTP round-trip through the proxy that can hit the 20s timeout.
+    client.csrf = resolve_csrf(client.cookies)
+    client.cookies["csrf_token"] = client.csrf
 
     _status("Adding items...")
 
