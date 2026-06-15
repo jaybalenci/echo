@@ -280,23 +280,41 @@ async def price(interaction: discord.Interaction, order_link: str, address: str)
         files=[_preparing_file()],
         wait=True,
     )
-    update_queue: asyncio.Queue[list[str] | str | None] = asyncio.Queue()
+    update_queue: asyncio.Queue[list[str] | str | dict | None] = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
     async def refresh_building_embed() -> None:
         added: list[str] = []
         status: str = ""
-        while True:
-            batch = await update_queue.get()
+        info_store: str = ""
+        info_address: str = ""
+
+        def _apply(batch: list[str] | str | dict | None) -> bool:
+            nonlocal added, status, info_store, info_address
             if batch is None:
-                break
-            if isinstance(batch, str):
+                return True
+            if isinstance(batch, dict):
+                info_store = batch.get("store", info_store)
+                info_address = batch.get("address", info_address)
+            elif isinstance(batch, str):
                 status = batch
             else:
                 added = batch
                 status = ""
+            return False
+
+        while True:
+            if _apply(await update_queue.get()):
+                return
+            # Drain any updates that piled up while we were awaiting the Discord API
+            while True:
+                try:
+                    if _apply(update_queue.get_nowait()):
+                        return
+                except asyncio.QueueEmpty:
+                    break
             await message.edit(
-                view=build_loading_view(added, status=status),
+                view=build_loading_view(added, status=status, store=info_store, address=info_address),
                 attachments=[_preparing_file()],
             )
 
@@ -308,6 +326,9 @@ async def price(interaction: discord.Interaction, order_link: str, address: str)
     def on_status(msg: str) -> None:
         loop.call_soon_threadsafe(update_queue.put_nowait, msg)
 
+    def on_info(key: str, value: str) -> None:
+        loop.call_soon_threadsafe(update_queue.put_nowait, {key: value})
+
     try:
         result = await asyncio.to_thread(
             run_price_order,
@@ -315,6 +336,7 @@ async def price(interaction: discord.Interaction, order_link: str, address: str)
             address,
             on_item_added=on_item_added,
             on_status=on_status,
+            on_info=on_info,
             promo_code=promo,
         )
     except Exception as exc:
@@ -408,12 +430,10 @@ async def track(interaction: discord.Interaction, tracking_link: str):
     ))
 
     if details.get("status_code") not in _TERMINAL_STATUSES:
-        # followup WebhookMessage tokens expire after 15 min — fetch the real Message
-        # so the poll loop edits with the bot token which never expires
-        try:
-            poll_msg = await msg.channel.fetch_message(msg.id)
-        except Exception:
-            poll_msg = msg
+        # WebhookMessage.edit() uses an expiring webhook token (15 min).
+        # PartialMessage.edit() uses the bot token which never expires.
+        channel = bot.get_partial_messageable(msg.channel.id)
+        poll_msg = channel.get_partial_message(msg.id)
         _start_poll(link_type, key, poll_msg)
 
 

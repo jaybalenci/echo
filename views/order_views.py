@@ -15,7 +15,20 @@ _CARD   = "<a:card:1515257513010790430>"
 _WARN   = "<a:warning:1515257724005519420>"
 
 
-def _loading_content(added_items: list[str], status: str = "") -> str:
+def _loading_content(
+    added_items: list[str],
+    status: str = "",
+    store: str = "",
+    address: str = "",
+) -> str:
+    info_lines = []
+    if store:
+        info_lines.append(f"* Restaurant: **{store}**")
+    if address:
+        info_lines.append(f"* Address: **{address}**")
+    info_block = "\n".join(info_lines) + "\n\n" if info_lines else ""
+
+    items_block = ""
     if added_items:
         counts: dict[str, int] = {}
         for name in added_items:
@@ -24,18 +37,25 @@ def _loading_content(added_items: list[str], status: str = "") -> str:
             f"+ {name} ×{count}" if count > 1 else f"+ {name}"
             for name, count in counts.items()
         )
-    else:
-        lines = f"+ {status}" if status else "+ Starting..."
+        items_block = f"### {_CART} Current Items\n```md\n{lines}\n```\n\n"
+
+    status_line = f"Status: {status}" if status else ""
+
     return (
         "# Loading Your Order\n\n"
-        "> Rebuilding your cart...\n"
-        f"### {_CART} Current Items\n"
-        f"```md\n{lines}\n```"
-    )
+        f"{info_block}"
+        f"{items_block}"
+        f"{status_line}"
+    ).rstrip()
 
 
-def build_loading_view(added_items: list[str], status: str = "") -> discord.ui.LayoutView:
-    content = _loading_content(added_items, status)
+def build_loading_view(
+    added_items: list[str],
+    status: str = "",
+    store: str = "",
+    address: str = "",
+) -> discord.ui.LayoutView:
+    content = _loading_content(added_items, status, store=store, address=address)
 
     class _LoadingOrderView(discord.ui.LayoutView):
         container = discord.ui.Container(
