@@ -75,10 +75,18 @@ def build_breakdown_content(
 
     fee_dollars = _parse_dollars(service_fee)
     total_dollars = _parse_dollars(pricing.total_display)
-    adjusted_total = f"${total_dollars + fee_dollars:.2f}"
+    discount_dollars = _parse_dollars(pricing.discounts_display)
+
+    adjusted = total_dollars + fee_dollars
+    undiscounted = adjusted + discount_dollars
 
     delivery_line = f"Delivery Fee: `{pricing.delivery_fee_display}`"
     fee_line = f"Service Fee   `{service_fee}`\n" if fee_dollars > 0 else ""
+
+    if discount_dollars > 0:
+        total_line = f"{_CARD} Total: **${adjusted:.2f}** *~~${undiscounted:.2f}~~*"
+    else:
+        total_line = f"{_CARD} **Total: `${adjusted:.2f}`**"
 
     text = (
         f"# {_CART} Order Breakdown\n"
@@ -92,7 +100,7 @@ def build_breakdown_content(
         f"{delivery_line}\n"
         f"Discounts     `{pricing.discounts_display}`\n"
         f"{fee_line}\n"
-        f"{_CARD} **Total: `{adjusted_total}`**"
+        f"{total_line}"
     )
     if failures:
         warn = "\n".join(f"- {line}" for line in failures)

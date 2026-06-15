@@ -7,12 +7,15 @@ import re
 from typing import Any
 from urllib.parse import urlencode
 
+from core.logger import vlog
 from doordash.web_client import (
     DoorDashWebSession,
     load_query,
     request_kwargs,
 )
 from pathlib import Path
+
+_validated_addresses: set[str] = set()
 
 ROOT = Path(__file__).resolve().parent.parent
 _GQL = Path(__file__).resolve().parent / "graphql"
@@ -376,9 +379,14 @@ def validate_address(
     if not requested:
         raise ValueError("Address cannot be empty.")
 
+    if requested.lower() in _validated_addresses:
+        vlog("address", "cached — skipping autocomplete lookup")
+        return
+
     for query in autocomplete_queries(requested):
         predictions = autocomplete_address(client, query, referer=referer)
         if predictions:
+            _validated_addresses.add(requested.lower())
             return
 
     if _has_unit_designator(requested):

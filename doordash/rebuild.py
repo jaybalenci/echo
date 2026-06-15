@@ -9,6 +9,7 @@ from typing import Any
 
 from curl_cffi.requests.exceptions import RequestException
 
+from core.logger import log, vlog
 from doordash.cart_extract import CartItemSpec
 from doordash.item_options import build_nested_from_item_page, fetch_item_page
 from doordash.web_client import (
@@ -26,23 +27,23 @@ def _clear_existing_carts(
     referer: str,
 ) -> None:
     """Find and clear any active build-account carts for this store."""
-    print(f"[clear_cart] Fetching active carts for store {store_id}")
+    vlog("clear_cart", f"fetching carts for store {store_id}")
     try:
         detailed = list_detailed_carts(client, referer=referer)
     except Exception as exc:
-        print(f"[clear_cart] listDetailedCarts failed: {exc}")
+        vlog("clear_cart", f"listDetailedCarts failed: {exc}")
         return
 
-    print(f"[clear_cart] Found {len(detailed)} active cart(s) total")
+    vlog("clear_cart", f"{len(detailed)} active cart(s) found")
     for entry in detailed:
         cart = entry.get("cart") or {}
         cart_id = str(cart.get("id") or "")
         restaurant = cart.get("restaurant") or {}
         cart_store_id = str(restaurant.get("id") or "")
-        print(f"[clear_cart] Cart {cart_id} → store_id={cart_store_id}")
+        vlog("clear_cart", f"cart {cart_id[:8]}… → store {cart_store_id}")
 
         if cart_store_id != store_id:
-            print(f"[clear_cart] Skipping (different store)")
+            vlog("clear_cart", "skipping (different store)")
             continue
 
         item_ids = [
@@ -53,19 +54,19 @@ def _clear_existing_carts(
         ]
 
         if not item_ids:
-            print(f"[clear_cart] Cart {cart_id} already empty")
+            vlog("clear_cart", f"cart {cart_id[:8]}… already empty")
             continue
 
-        print(f"[clear_cart] Removing {len(item_ids)} item(s) from cart {cart_id}: {item_ids}")
+        vlog("clear_cart", f"removing {len(item_ids)} item(s) from cart {cart_id[:8]}…")
         for item_id in item_ids:
             try:
                 resp = remove_cart_item(client, cart_id=cart_id, item_id=item_id, referer=referer)
                 if resp.get("errors"):
-                    print(f"[clear_cart] Error removing {item_id}: {resp['errors']}")
+                    vlog("clear_cart", f"error removing {item_id}: {resp['errors']}")
                 else:
-                    print(f"[clear_cart] Removed {item_id} OK")
+                    vlog("clear_cart", f"removed {item_id} ✓")
             except Exception as exc:
-                print(f"[clear_cart] Exception removing {item_id}: {exc}")
+                vlog("clear_cart", f"exception removing {item_id}: {exc}")
 
 
 def rebuild_cart(
@@ -103,11 +104,12 @@ def rebuild_cart(
         added = False
         last_err = ""
         item_page_fetched = False
-        print(f"[rebuild] Adding {spec.quantity}x {spec.item_name!r} (item_id={spec.item_id})")
+        log("rebuild", f"+ {spec.quantity}x {spec.item_name}")
+        vlog("rebuild", f"  item_id={spec.item_id}")
         attempt_idx = 0
         while attempt_idx < len(nested_attempts):
             nested = nested_attempts[attempt_idx]
-            print(f"  [attempt {attempt_idx}] nestedOptions={nested[:200]}")
+            vlog("rebuild", f"  attempt {attempt_idx}: nestedOptions={nested[:200]}")
             item_input = spec.to_add_cart_input()
             item_input["nestedOptions"] = nested
             try:
@@ -119,19 +121,19 @@ def rebuild_cart(
                 )
             except RequestException as exc:
                 last_err = str(exc)
-                print(f"  [attempt {attempt_idx}] RequestException: {last_err}")
+                vlog("rebuild", f"  attempt {attempt_idx} RequestException: {last_err}")
                 attempt_idx += 1
                 continue
 
             if last_response.get("errors"):
                 last_err = json.dumps(last_response["errors"])[:300]
-                print(f"  [attempt {attempt_idx}] GraphQL errors: {last_err}")
+                vlog("rebuild", f"  attempt {attempt_idx} GraphQL errors: {last_err}")
 
                 # On "wrong level" error, fetch the item page and inject a
                 # hierarchy-corrected attempt immediately after this one.
                 if "wrong level" in last_err and not item_page_fetched:
                     item_page_fetched = True
-                    print(f"  [item_page] fetching option hierarchy for item {spec.item_id}")
+                    vlog("rebuild", f"  fetching option hierarchy for item {spec.item_id}")
                     item_page = fetch_item_page(client, spec.store_id, spec.item_id, referer)
                     if item_page:
                         corrected = build_nested_from_item_page(nested, item_page)
@@ -143,22 +145,23 @@ def rebuild_cart(
             cart = (last_response.get("data") or {}).get("addCartItemV2")
             if not cart:
                 last_err = "no addCartItemV2 in response"
-                print(f"  [attempt {attempt_idx}] {last_err}")
+                vlog("rebuild", f"  attempt {attempt_idx}: {last_err}")
                 attempt_idx += 1
                 continue
 
             cart_id = str(cart.get("id") or cart_id)
             last_successful_cart = cart
             added = True
-            print(f"  [attempt {attempt_idx}] OK — cart_id={cart_id}")
+            log("rebuild", f"  ✓ added (attempt {attempt_idx})")
+            vlog("rebuild", f"  cart_id={cart_id}")
             break
 
         if not added:
-            print(f"[rebuild] FAILED {spec.item_name!r} after {len(nested_attempts)} attempts")
             if "Item is not available" in last_err:
                 display_err = "Out of Stock"
             else:
                 display_err = last_err
+            log("rebuild", f"  ✗ FAILED — {display_err}")
             failed.append(f"{spec.quantity}x {spec.item_name} — {display_err}")
             continue
 
@@ -176,27 +179,42 @@ def schedule_cart_cleanup(
     cart_data: dict[str, Any],
     referer: str,
 ) -> None:
-    """Fire a daemon thread to remove all items from the cart after a price check.
-
-    This keeps the account clean so the next price check skips the slow
-    listDetailedCarts + removeCartItem loop inside _clear_existing_carts.
-    """
-    item_ids = [
-        str(oi["id"])
-        for order in (cart_data.get("orders") or [])
-        for oi in (order.get("orderItems") or [])
-        if oi.get("id")
-    ]
-    if not item_ids:
-        return
+    """Fire a daemon thread to remove ALL current items from the cart after a price check."""
+    def _get_item_ids() -> list[str]:
+        try:
+            all_carts = list_detailed_carts(client, referer=referer)
+            target = next(
+                (e["cart"] for e in all_carts
+                 if str((e.get("cart") or {}).get("id") or "") == cart_id),
+                None,
+            )
+            if target is not None:
+                return [
+                    str(oi["id"])
+                    for order in (target.get("orders") or [])
+                    for oi in (order.get("orderItems") or [])
+                    if oi.get("id")
+                ]
+        except Exception as exc:
+            vlog("cleanup", f"could not fetch live cart, using rebuild data: {exc}")
+        return [
+            str(oi["id"])
+            for order in (cart_data.get("orders") or [])
+            for oi in (order.get("orderItems") or [])
+            if oi.get("id")
+        ]
 
     def _run() -> None:
-        print(f"[cleanup] clearing {len(item_ids)} item(s) from cart {cart_id}")
+        item_ids = _get_item_ids()
+        if not item_ids:
+            vlog("cleanup", f"cart {cart_id[:8]}… already empty")
+            return
+        log("cleanup", f"clearing {len(item_ids)} item(s) from cart {cart_id[:8]}…")
         for item_id in item_ids:
             try:
                 remove_cart_item(client, cart_id=cart_id, item_id=item_id, referer=referer)
             except Exception as exc:
-                print(f"[cleanup] failed to remove {item_id}: {exc}")
-        print(f"[cleanup] done — cart {cart_id} cleared")
+                log("cleanup", f"✗ failed to remove {item_id}: {exc}")
+        log("cleanup", "✓ done")
 
     threading.Thread(target=_run, daemon=True).start()

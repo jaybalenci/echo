@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from curl_cffi.requests.exceptions import RequestException
 
 from core.account_pool import acquire
+from core.logger import log
 from doordash.address import set_delivery_address, validate_address
 from doordash.cart_extract import extract_cart_items
 from doordash.checkout import PriceBreakdown, apply_promo_code, fetch_checkout, summarize_order_items
@@ -16,6 +17,14 @@ from doordash.group_order import join_group_order
 from doordash.rebuild import rebuild_cart, schedule_cart_cleanup
 from doordash.web_client import DoorDashWebSession, store_referer
 from views.order_views import PriceBreakdownFields
+
+
+def _warm_and_validate(client: DoorDashWebSession, address: str) -> None:
+    log("session", "warming...")
+    client.warm("https://www.doordash.com/")
+    log("session", "validating address...")
+    validate_address(client, address)
+    log("session", "✓ ready")
 
 
 @dataclass
@@ -48,22 +57,35 @@ def run_price_order(
             _status("Checking order...")
             pre_client = DoorDashWebSession(cookies)
 
-            # Phase 1: warm session + fetch group order at the same time
+            # Phase 1: warm+validate session and fetch group order at the same time.
+            # validate_address only needs warm to finish, so bundling them lets it
+            # overlap with join_group_order instead of running after both complete.
+            log("price", "phase 1: group order + session warm...")
             with ThreadPoolExecutor(max_workers=2) as pool:
-                f_warm = pool.submit(pre_client.warm, "https://www.doordash.com/")
+                f_setup = pool.submit(_warm_and_validate, pre_client, address)
                 f_join = pool.submit(join_group_order, cookies, order_link)
-            # Both are guaranteed done when the pool exits
 
             try:
-                f_warm.result()
+                f_setup.result()
             except RequestException as exc:
                 if "403" in str(exc):
                     tried.add(idx)
                     continue
                 raise
 
-            validate_address(pre_client, address)
-            cart_id, _, source_cart = f_join.result()
+            try:
+                cart_id, _, source_cart = f_join.result()
+            except RuntimeError as exc:
+                exc_str = str(exc)
+                if "timed out" in exc_str.lower() or "curl: (28)" in exc_str:
+                    log("price", f"join timed out (account {idx + 1}), retrying...")
+                    tried.add(idx)
+                    continue
+                if "403" in exc_str:
+                    log("price", f"join blocked 403 (account {idx + 1}), retrying...")
+                    tried.add(idx)
+                    continue
+                raise
 
             specs = extract_cart_items(source_cart)
             if not specs:
@@ -71,10 +93,12 @@ def run_price_order(
 
             restaurant = source_cart.get("restaurant") or {}
             menu_id = str((source_cart.get("menu") or {}).get("id") or "")
+            log("price", f"✓ group order → {restaurant.get('name', '?')} ({len(specs)} item(s))")
 
             # Phase 2: rebuild cart + set delivery address at the same time.
             # set_delivery_address only updates the account's default address (no cart
             # knowledge needed), so pre_client can handle it while rebuild runs.
+            log("price", f"phase 2: building cart ({len(specs)} items)...")
             with ThreadPoolExecutor(max_workers=2) as pool:
                 f_rebuild = pool.submit(
                     rebuild_cart,
@@ -89,7 +113,14 @@ def run_price_order(
                 )
 
             rebuilt, failures, client, built_cart_id = f_rebuild.result()
-            address_result = f_address.result()
+            try:
+                address_result = f_address.result()
+            except RequestException as exc:
+                if "403" in str(exc):
+                    log("price", f"address blocked 403 (account {idx + 1}), retrying...")
+                    tried.add(idx)
+                    continue
+                raise
 
             if not built_cart_id:
                 if failures:
@@ -108,7 +139,14 @@ def run_price_order(
                 _status("Applying promotion...")
                 apply_promo_code(client, built_cart_id, promo_code, lat=lat, lng=lng)
 
-            checkout_cart = fetch_checkout(client, built_cart_id, lat=lat, lng=lng)
+            try:
+                checkout_cart = fetch_checkout(client, built_cart_id, lat=lat, lng=lng)
+            except RequestException as exc:
+                if "403" in str(exc):
+                    log("price", f"checkout blocked 403 (account {idx + 1}), retrying...")
+                    tried.add(idx)
+                    continue
+                raise
 
         breakdown = PriceBreakdown.from_cart(checkout_cart)
         items = summarize_order_items(checkout_cart)

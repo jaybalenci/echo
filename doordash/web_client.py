@@ -144,7 +144,7 @@ def _build_proxy_url(raw: str) -> str:
 
 
 def request_kwargs() -> dict[str, Any]:
-    kw: dict[str, Any] = {"impersonate": IMPERSONATE, "timeout": 60}
+    kw: dict[str, Any] = {"impersonate": IMPERSONATE, "timeout": 20}
     raw = os.getenv("DOORDASH_PROXY", "").strip()
     if raw:
         kw["proxy"] = _build_proxy_url(raw)

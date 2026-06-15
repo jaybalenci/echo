@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from curl_cffi.requests.exceptions import RequestException
 
+from core.logger import log, vlog
 from doordash.order_link import group_cart_referer, is_url_code, parse_cart_reference
 from doordash.web_client import (
     DETAILED_CART_QUERY,
@@ -67,6 +68,7 @@ def join_group_order(
     order_link: str,
 ) -> tuple[str, DoorDashWebSession, dict[str, Any]]:
     """Open the group-order invite so the session can read the shared cart."""
+    log("group", "opening order link...")
     cart_ref = parse_cart_reference(order_link)
     client = DoorDashWebSession(dict(cookies))
     resolved_uuid: str | None = None
@@ -101,6 +103,8 @@ def join_group_order(
             )
 
     query_cart_id = resolved_uuid or cart_ref
+    vlog("group", f"cart UUID: {query_cart_id}")
+    log("group", "fetching cart items...")
     referer = group_cart_referer(query_cart_id)
     client.warm(referer)
     client.csrf = resolve_csrf(client.cookies)

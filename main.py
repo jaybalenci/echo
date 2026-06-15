@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from core.logger import log
 from core.map_image import generate_tracking_map, geocode
 from core.price_order import run_price_order
 from core.track_order import fetch_gift_tracking, fetch_drive_tracking, fetch_tracking, fetch_dasher_location
@@ -66,7 +67,7 @@ def _write_poll_state(state: dict) -> None:
         _POLLS_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _POLLS_STATE_FILE.write_text(json.dumps(state, indent=2))
     except Exception as exc:
-        print(f"[track persist] failed to write state: {exc}")
+        log("persist", f"failed to write poll state: {exc}")
 
 
 def _persist_poll(key: str, link_type: str, channel_id: int, message_id: int) -> None:
@@ -102,7 +103,7 @@ async def _log_activity(
             embed.add_field(name=name, value=value or "—", inline=False)
         await channel.send(embed=embed)
     except Exception as exc:
-        print(f"[log] failed to send activity log: {exc}")
+        log("log", f"failed to send activity log: {exc}")
 
 
 def _city_state(address: str) -> str:
@@ -160,7 +161,7 @@ async def _make_tracking_message(
                     picked_up=picked_up,
                 )
             except Exception as exc:
-                print(f"[map] generation failed: {exc}")
+                log("map", f"generation failed: {exc}")
 
     if map_png:
         files.append(discord.File(io.BytesIO(map_png), filename="tracking_map.png"))
@@ -183,7 +184,7 @@ async def _poll_tracking(link_type: str, key: str, message: discord.Message) -> 
             errors = 0
         except Exception as exc:
             errors += 1
-            print(f"[track poll] fetch error ({errors}/{_POLL_MAX_ERRORS}) for {key}: {exc}")
+            log("poll", f"fetch error ({errors}/{_POLL_MAX_ERRORS}) for {key}: {exc}")
             if errors >= _POLL_MAX_ERRORS:
                 break
             continue
@@ -198,7 +199,7 @@ async def _poll_tracking(link_type: str, key: str, message: discord.Message) -> 
             break  # message deleted
         except Exception as exc:
             edit_errors += 1
-            print(f"[track poll] edit error ({edit_errors}/{_POLL_MAX_ERRORS}) for {key}: {exc}")
+            log("poll", f"edit error ({edit_errors}/{_POLL_MAX_ERRORS}) for {key}: {exc}")
             if edit_errors >= _POLL_MAX_ERRORS:
                 break
 
@@ -220,7 +221,7 @@ def _start_poll(link_type: str, key: str, message: discord.Message) -> None:
 
 async def setup_hook():
     synced = await bot.tree.sync()
-    print(f"Synced {len(synced)} slash command(s): {[cmd.name for cmd in synced]}")
+    log("bot", f"synced {len(synced)} command(s): {[cmd.name for cmd in synced]}")
 
 
 bot.setup_hook = setup_hook
@@ -231,7 +232,7 @@ async def _restore_polls() -> None:
     to_restore = [key for key in state if key not in _active_polls]
     if not to_restore:
         return
-    print(f"[track restore] restoring {len(to_restore)} poll(s)...")
+    log("restore", f"restoring {len(to_restore)} poll(s)...")
     for key in to_restore:
         info = state[key]
         try:
@@ -239,16 +240,15 @@ async def _restore_polls() -> None:
             channel = bot.get_partial_messageable(info["channel_id"])
             message = channel.get_partial_message(info["message_id"])
             _start_poll(info["link_type"], key, message)
-            print(f"[track restore] resumed {info['link_type']} poll for {key}")
+            log("restore", f"resumed {info['link_type']} poll for {key}")
         except Exception as exc:
-            print(f"[track restore] failed for {key}: {exc}")
+            log("restore", f"failed for {key}: {exc}")
             _unpersist_poll(key)
 
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print("------")
+    log("bot", f"logged in as {bot.user} (ID: {bot.user.id})")
     await _restore_polls()
 
 
@@ -321,7 +321,7 @@ async def price(interaction: discord.Interaction, order_link: str, address: str)
         await update_queue.put(None)
         await refresh_task
         err_text = str(exc) or exc.__class__.__name__
-        print(traceback.format_exc())
+        log("error", traceback.format_exc().strip())
         await message.edit(
             view=build_error_view(err_text),
             attachments=[],
@@ -381,7 +381,7 @@ async def track(interaction: discord.Interaction, tracking_link: str):
         link_type, key, details = await asyncio.to_thread(fetch_tracking, tracking_link)
     except Exception as exc:
         err_text = str(exc) or exc.__class__.__name__
-        print(traceback.format_exc())
+        log("error", traceback.format_exc().strip())
         await interaction.followup.send(view=build_error_view(err_text))
         asyncio.create_task(_log_activity(
             interaction.user,

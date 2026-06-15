@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from core.logger import log, vlog
 from doordash.web_client import BROWSER_UA, DoorDashWebSession, load_query, request_kwargs
 
 CHECKOUT_URL = "https://www.doordash.com/graphql/checkout?operation=checkout"
@@ -29,6 +30,7 @@ def fetch_checkout(
     lng: float,
     should_apply_credits: bool = True,
 ) -> dict[str, Any]:
+    log("checkout", "fetching final price...")
     referer = checkout_referer(cart_id, lat, lng)
     data = client.graphql(
         CHECKOUT_URL,
@@ -45,6 +47,7 @@ def fetch_checkout(
     cart = (data.get("data") or {}).get("orderCart")
     if not cart:
         raise RuntimeError("Checkout response missing orderCart.")
+    log("checkout", "✓ done")
     return cart
 
 
@@ -89,10 +92,21 @@ def apply_promo_code(
             json=payload,
             **request_kwargs(),
         )
-        print(f"[promo] {resp.status_code}: {resp.text[:300]}")
+        vlog("promo", f"{resp.status_code}: {resp.text[:300]}")
+        if resp.status_code < 400:
+            try:
+                data = resp.json()
+                if data.get("is_redeemable"):
+                    log("promo", f"✓ {promo_code} applied")
+                else:
+                    log("promo", f"not redeemable ({promo_code})")
+            except Exception:
+                log("promo", f"status {resp.status_code}")
+        else:
+            log("promo", f"✗ failed ({resp.status_code})")
         return resp.status_code < 400
     except Exception as exc:
-        print(f"[promo] exception: {exc}")
+        log("promo", f"✗ exception: {exc}")
         return False
 
 

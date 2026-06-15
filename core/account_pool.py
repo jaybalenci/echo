@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
 
+from core.logger import log
 from doordash.web_client import load_account_pool as _load
 
 
@@ -61,10 +62,10 @@ def acquire(*, exclude: frozenset[int] = frozenset()) -> Generator[tuple[int, di
 
     account = _accounts[idx]
     email = _email_from_cookies(account)
-    print(f"[account_pool] using account {idx + 1}/{len(_accounts)}: {email}")
+    log("pool", f"account {idx + 1}/{len(_accounts)}: {email}")
     try:
         yield idx, account
     finally:
         with _lock:
             _in_use.discard(idx)
-        print(f"[account_pool] released account {idx + 1}: {email}")
+        log("pool", f"released {idx + 1}: {email}")
