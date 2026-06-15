@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 
 from curl_cffi.requests.exceptions import RequestException
 
@@ -12,8 +13,8 @@ from doordash.address import set_delivery_address, validate_address
 from doordash.cart_extract import extract_cart_items
 from doordash.checkout import PriceBreakdown, apply_promo_code, fetch_checkout, summarize_order_items
 from doordash.group_order import join_group_order
-from doordash.rebuild import rebuild_cart
-from doordash.web_client import DoorDashWebSession, cart_referer
+from doordash.rebuild import rebuild_cart, schedule_cart_cleanup
+from doordash.web_client import DoorDashWebSession, store_referer
 from views.order_views import PriceBreakdownFields
 
 
@@ -25,6 +26,7 @@ class PriceOrderResult:
     pricing: PriceBreakdownFields
     cart_id: str
     failures: list[str]
+    cleanup_fn: Callable[[], None] | None = field(default=None, repr=False)
 
 
 def run_price_order(
@@ -43,20 +45,25 @@ def run_price_order(
 
     while True:
         with acquire(exclude=frozenset(tried)) as (idx, cookies):
-            _status("Validating address...")
+            _status("Checking order...")
             pre_client = DoorDashWebSession(cookies)
+
+            # Phase 1: warm session + fetch group order at the same time
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_warm = pool.submit(pre_client.warm, "https://www.doordash.com/")
+                f_join = pool.submit(join_group_order, cookies, order_link)
+            # Both are guaranteed done when the pool exits
+
             try:
-                pre_client.warm("https://www.doordash.com/")
+                f_warm.result()
             except RequestException as exc:
                 if "403" in str(exc):
                     tried.add(idx)
-                    continue  # release this account and try the next one
+                    continue
                 raise
 
             validate_address(pre_client, address)
-
-            _status("Fetching group order...")
-            cart_id, _, source_cart = join_group_order(cookies, order_link)
+            cart_id, _, source_cart = f_join.result()
 
             specs = extract_cart_items(source_cart)
             if not specs:
@@ -65,24 +72,32 @@ def run_price_order(
             restaurant = source_cart.get("restaurant") or {}
             menu_id = str((source_cart.get("menu") or {}).get("id") or "")
 
-            rebuilt, failures, client, built_cart_id = rebuild_cart(
-                specs,
-                restaurant,
-                menu_id,
-                cookies,
-                on_item_added=on_item_added,
-                on_status=on_status,
-            )
+            # Phase 2: rebuild cart + set delivery address at the same time.
+            # set_delivery_address only updates the account's default address (no cart
+            # knowledge needed), so pre_client can handle it while rebuild runs.
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_rebuild = pool.submit(
+                    rebuild_cart,
+                    specs, restaurant, menu_id, cookies,
+                    on_item_added=on_item_added,
+                    on_status=on_status,
+                )
+                f_address = pool.submit(
+                    set_delivery_address,
+                    pre_client, address,
+                    referer="https://www.doordash.com/",
+                )
+
+            rebuilt, failures, client, built_cart_id = f_rebuild.result()
+            address_result = f_address.result()
+
             if not built_cart_id:
                 if failures:
                     lines = "\n".join(f"• {f}" for f in failures)
                     raise RuntimeError(f"Could not add any items to the cart:\n{lines}")
-                raise RuntimeError("The cart appears to be empty. Make sure the group order has items before price-checking.")
-
-            referer = cart_referer(built_cart_id)
-            client.warm(referer)
-
-            address_result = set_delivery_address(client, address, referer=referer)
+                raise RuntimeError(
+                    "The cart appears to be empty. Make sure the group order has items before price-checking."
+                )
 
             default_address = address_result.get("default_address") or {}
             printable_address = default_address.get("printableAddress") or address
@@ -93,12 +108,7 @@ def run_price_order(
                 _status("Applying promotion...")
                 apply_promo_code(client, built_cart_id, promo_code, lat=lat, lng=lng)
 
-            checkout_cart = fetch_checkout(
-                client,
-                built_cart_id,
-                lat=lat,
-                lng=lng,
-            )
+            checkout_cart = fetch_checkout(client, built_cart_id, lat=lat, lng=lng)
 
         breakdown = PriceBreakdown.from_cart(checkout_cart)
         items = summarize_order_items(checkout_cart)
@@ -113,6 +123,10 @@ def run_price_order(
             total_display=breakdown.total_display,
         )
 
+        # Capture cleanup args in a closure — called by main.py AFTER the price
+        # is shown to the user, not during the price check itself.
+        _client, _cart_id, _rebuilt, _referer = client, built_cart_id, rebuilt, store_referer(restaurant, menu_id)
+
         return PriceOrderResult(
             address=printable_address,
             store=restaurant.get("name") or "Unknown Restaurant",
@@ -120,4 +134,5 @@ def run_price_order(
             pricing=pricing,
             cart_id=built_cart_id,
             failures=failures,
+            cleanup_fn=lambda: schedule_cart_cleanup(_client, _cart_id, _rebuilt, _referer),
         )

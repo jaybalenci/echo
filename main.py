@@ -266,16 +266,20 @@ def _dd_file() -> discord.File:
     address="Delivery address",
 )
 async def price(interaction: discord.Interaction, order_link: str, address: str):
+    # Defer immediately — Discord requires a response within 3 seconds.
+    # Any work before this line risks a 10062 Unknown Interaction error.
+    await interaction.response.defer()
+
     user_settings = get_user_settings(interaction.user.id)
     promo = user_settings.get("promotion", "Not Set")
     if not promo or promo == "Not Set":
         promo = "YOUGOT40"
 
-    await interaction.response.send_message(
+    message = await interaction.followup.send(
         view=build_loading_view([]),
         files=[_preparing_file()],
+        wait=True,
     )
-    message = await interaction.original_response()
     update_queue: asyncio.Queue[list[str] | str | None] = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -353,6 +357,8 @@ async def price(interaction: discord.Interaction, order_link: str, address: str)
         view=build_breakdown_view(breakdown_text),
         attachments=[_dd_file()],
     )
+    if result.cleanup_fn:
+        result.cleanup_fn()
     asyncio.create_task(_log_activity(
         interaction.user,
         "Price Check",

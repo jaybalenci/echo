@@ -82,8 +82,8 @@ def generate_tracking_map(
     dasher_lat: float | None = None,
     dasher_lng: float | None = None,
     picked_up: bool = False,
-    width: int = 640,
-    height: int = 360,
+    width: int = 500,
+    height: int = 280,
 ) -> bytes:
     """
     Returns PNG bytes of the tracking map.
@@ -116,7 +116,7 @@ def generate_tracking_map(
 
     static_url = (
         f"{_STATIC_URL}/{','.join(overlays)}"
-        f"/auto/{width}x{height}@2x"
+        f"/auto/{width}x{height}"
         f"?padding=60&access_token={_get_token()}"
     )
 

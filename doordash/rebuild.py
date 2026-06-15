@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -80,17 +81,15 @@ def rebuild_cart(
         if on_status:
             on_status(msg)
 
-    store_id = str(restaurant.get("id") or "")
     referer = store_referer(restaurant, menu_id)
     client = DoorDashWebSession(build_cookies)
     client.warm(referer)
 
-    _status("Clearing previous cart...")
-    _clear_existing_carts(client, store_id, referer)
     _status("Adding items...")
 
     cart_id = ""
     last_response: dict[str, Any] = {}
+    last_successful_cart: dict[str, Any] = {}
     failed: list[str] = []
     added_lines: list[str] = []
 
@@ -149,6 +148,7 @@ def rebuild_cart(
                 continue
 
             cart_id = str(cart.get("id") or cart_id)
+            last_successful_cart = cart
             added = True
             print(f"  [attempt {attempt_idx}] OK — cart_id={cart_id}")
             break
@@ -167,5 +167,36 @@ def rebuild_cart(
         if on_item_added:
             on_item_added(list(added_lines))
 
-    rebuilt = (last_response.get("data") or {}).get("addCartItemV2") or {}
-    return rebuilt, failed, client, cart_id
+    return last_successful_cart, failed, client, cart_id
+
+
+def schedule_cart_cleanup(
+    client: DoorDashWebSession,
+    cart_id: str,
+    cart_data: dict[str, Any],
+    referer: str,
+) -> None:
+    """Fire a daemon thread to remove all items from the cart after a price check.
+
+    This keeps the account clean so the next price check skips the slow
+    listDetailedCarts + removeCartItem loop inside _clear_existing_carts.
+    """
+    item_ids = [
+        str(oi["id"])
+        for order in (cart_data.get("orders") or [])
+        for oi in (order.get("orderItems") or [])
+        if oi.get("id")
+    ]
+    if not item_ids:
+        return
+
+    def _run() -> None:
+        print(f"[cleanup] clearing {len(item_ids)} item(s) from cart {cart_id}")
+        for item_id in item_ids:
+            try:
+                remove_cart_item(client, cart_id=cart_id, item_id=item_id, referer=referer)
+            except Exception as exc:
+                print(f"[cleanup] failed to remove {item_id}: {exc}")
+        print(f"[cleanup] done — cart {cart_id} cleared")
+
+    threading.Thread(target=_run, daemon=True).start()
