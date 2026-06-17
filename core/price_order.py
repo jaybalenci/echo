@@ -13,7 +13,7 @@ from core.account_pool import acquire
 from core.logger import log
 from doordash.address import set_delivery_address
 from doordash.cart_extract import extract_cart_items
-from doordash.checkout import PriceBreakdown, apply_promo_code, fetch_checkout, summarize_order_items
+from doordash.checkout import PriceBreakdown, apply_promo_code, fetch_checkout, summarize_order_items, summarize_order_items_detail
 from doordash.group_order import join_group_order
 from doordash.rebuild import rebuild_cart, schedule_cart_cleanup
 from doordash.web_client import DoorDashWebSession, store_referer
@@ -43,6 +43,7 @@ class PriceOrderResult:
     address: str
     store: str
     items: list[tuple[str, int]]
+    items_detail: list[dict]  # [{name, qty, img}]
     pricing: PriceBreakdownFields
     cart_id: str
     failures: list[str]
@@ -227,6 +228,9 @@ def run_price_order(
         items = summarize_order_items(checkout_cart)
         if not items and rebuilt:
             items = summarize_order_items(rebuilt)
+        items_detail = summarize_order_items_detail(checkout_cart)
+        if not items_detail and rebuilt:
+            items_detail = summarize_order_items_detail(rebuilt)
 
         pricing = PriceBreakdownFields(
             subtotal_display=breakdown.subtotal_display,
@@ -244,6 +248,7 @@ def run_price_order(
             address=printable_address,
             store=restaurant.get("name") or "Unknown Restaurant",
             items=items,
+            items_detail=items_detail,
             pricing=pricing,
             cart_id=built_cart_id,
             failures=item_failures,

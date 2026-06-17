@@ -45,9 +45,10 @@ bot.tree.allowed_installs = app_commands.AppInstallationType(guild=True, user=Tr
 bot.tree.allowed_contexts = app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True)
 
 _TERMINAL_STATUSES = {"delivered", "cancelled"}
-_POLL_INTERVAL = 10        # seconds between updates
-_POLL_MAX_CYCLES = 1440    # 4 hours max (1440 × 10s)
-_POLL_MAX_ERRORS = 5       # stop after 5 consecutive fetch failures
+_POLL_INTERVAL = 10            # seconds between updates
+_POLL_MAX_CYCLES = 1440        # 4 hours max (1440 × 10s)
+_POLL_MAX_FETCH_ERRORS = 20    # ~3 min of consecutive 403s before giving up
+_POLL_MAX_EDIT_ERRORS = 5      # stop quickly if the message is gone/inaccessible
 
 _active_polls: dict[str, asyncio.Task] = {}  # key → background task
 _last_dasher_loc: dict[str, tuple[float, float]] = {}  # key → last known (lat, lng)
@@ -170,52 +171,83 @@ async def _make_tracking_message(
     return view, files
 
 
-async def _poll_tracking(link_type: str, key: str, message: discord.Message) -> None:
+async def _poll_tracking(
+    link_type: str, key: str, message: discord.Message,
+    *, followup: discord.Webhook | None = None,
+) -> None:
     """Edit the tracking message every 10 seconds until delivered or cancelled."""
-    errors = 0
+    fetch_errors = 0
     edit_errors = 0
-    for cycle in range(_POLL_MAX_CYCLES):
-        await asyncio.sleep(_POLL_INTERVAL)
-        try:
-            if link_type == "gift":
-                details = await asyncio.to_thread(fetch_gift_tracking, key)
-            else:
-                details = await asyncio.to_thread(fetch_drive_tracking, key)
-            errors = 0
-        except Exception as exc:
-            errors += 1
-            log("poll", f"fetch error ({errors}/{_POLL_MAX_ERRORS}) for {key}: {exc}")
-            if errors >= _POLL_MAX_ERRORS:
+    try:
+        for cycle in range(_POLL_MAX_CYCLES):
+            await asyncio.sleep(_POLL_INTERVAL)
+            try:
+                if link_type == "gift":
+                    details = await asyncio.to_thread(fetch_gift_tracking, key)
+                else:
+                    details = await asyncio.to_thread(fetch_drive_tracking, key)
+                fetch_errors = 0
+            except Exception as exc:
+                fetch_errors += 1
+                log("poll", f"fetch error ({fetch_errors}/{_POLL_MAX_FETCH_ERRORS}) for {key}: {exc}")
+                if fetch_errors >= _POLL_MAX_FETCH_ERRORS:
+                    break
+                continue
+
+            # Only call fetch_dasher_location every 3rd cycle (every 30s) to reduce API load
+            fetch_loc = cycle % 3 == 0
+            try:
+                view, files = await _make_tracking_message(details, link_type, key, fetch_loc=fetch_loc)
+            except Exception as exc:
+                log("poll", f"render error for {key}: {exc}")
+                continue  # skip this cycle, try again next
+
+            try:
+                await message.edit(view=view, attachments=files)
+                edit_errors = 0
+            except discord.NotFound:
+                break  # message deleted
+            except discord.Forbidden as exc:
+                # 50001 = bot token has no channel access (user-install / private channel context).
+                # Fall back to the interaction followup webhook for as long as its token is valid.
+                if exc.code == 50001 and followup is not None:
+                    try:
+                        await followup.edit_message(message.id, view=view, attachments=files)
+                        edit_errors = 0
+                    except discord.NotFound:
+                        break  # message deleted
+                    except Exception as exc2:
+                        edit_errors += 1
+                        log("poll", f"edit error ({edit_errors}/{_POLL_MAX_EDIT_ERRORS}) for {key}: {exc2}")
+                        if edit_errors >= _POLL_MAX_EDIT_ERRORS:
+                            break
+                else:
+                    edit_errors += 1
+                    log("poll", f"edit error ({edit_errors}/{_POLL_MAX_EDIT_ERRORS}) for {key}: {exc}")
+                    if edit_errors >= _POLL_MAX_EDIT_ERRORS:
+                        break
+            except Exception as exc:
+                edit_errors += 1
+                log("poll", f"edit error ({edit_errors}/{_POLL_MAX_EDIT_ERRORS}) for {key}: {exc}")
+                if edit_errors >= _POLL_MAX_EDIT_ERRORS:
+                    break
+
+            if details.get("status_code") in _TERMINAL_STATUSES:
                 break
-            continue
-
-        # Only call fetch_dasher_location every 3rd cycle (every 30s) to reduce API load
-        fetch_loc = cycle % 3 == 0
-        view, files = await _make_tracking_message(details, link_type, key, fetch_loc=fetch_loc)
-        try:
-            await message.edit(view=view, attachments=files)
-            edit_errors = 0
-        except discord.NotFound:
-            break  # message deleted
-        except Exception as exc:
-            edit_errors += 1
-            log("poll", f"edit error ({edit_errors}/{_POLL_MAX_ERRORS}) for {key}: {exc}")
-            if edit_errors >= _POLL_MAX_ERRORS:
-                break
-
-        if details.get("status_code") in _TERMINAL_STATUSES:
-            break
-
-    _active_polls.pop(key, None)
-    _last_dasher_loc.pop(key, None)
-    _unpersist_poll(key)
+    finally:
+        _active_polls.pop(key, None)
+        _last_dasher_loc.pop(key, None)
+        _unpersist_poll(key)
 
 
-def _start_poll(link_type: str, key: str, message: discord.Message) -> None:
+def _start_poll(
+    link_type: str, key: str, message: discord.Message,
+    *, followup: discord.Webhook | None = None,
+) -> None:
     if key in _active_polls:
         _active_polls[key].cancel()
     _persist_poll(key, link_type, message.channel.id, message.id)
-    task = asyncio.create_task(_poll_tracking(link_type, key, message))
+    task = asyncio.create_task(_poll_tracking(link_type, key, message, followup=followup))
     _active_polls[key] = task
 
 
@@ -430,11 +462,12 @@ async def track(interaction: discord.Interaction, tracking_link: str):
     ))
 
     if details.get("status_code") not in _TERMINAL_STATUSES:
-        # WebhookMessage.edit() uses an expiring webhook token (15 min).
-        # PartialMessage.edit() uses the bot token which never expires.
+        # PartialMessage.edit() uses the bot token (no expiry) — works in guild channels
+        # and bot DMs. For user-install / private channel contexts the bot token gets
+        # 50001, so we pass the followup webhook as a fallback (valid for ~15 min).
         channel = bot.get_partial_messageable(msg.channel.id)
         poll_msg = channel.get_partial_message(msg.id)
-        _start_poll(link_type, key, poll_msg)
+        _start_poll(link_type, key, poll_msg, followup=interaction.followup)
 
 
 @bot.tree.command(name="settings", description="Configure your personal settings")

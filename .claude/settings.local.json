@@ -7,7 +7,9 @@
       "mcp__visualize__show_widget",
       "Bash(Get-Item map_b64.txt)",
       "Bash(echo \"Done, size: $\\(Get-Item map_b64.txt)",
-      "Bash(start \"C:\\\\Users\\\\jason\\\\Documents\\\\Canary bot\\\\tracking_map_preview.png\")"
+      "Bash(start \"C:\\\\Users\\\\jason\\\\Documents\\\\Canary bot\\\\tracking_map_preview.png\")",
+      "PowerShell(pip show python-telegram-bot 2>$null)",
+      "PowerShell(pip show aiogram 2>$null)"
     ]
   }
 }

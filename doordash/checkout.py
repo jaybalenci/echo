@@ -151,14 +151,15 @@ class PriceBreakdown:
     def from_cart(cls, cart: dict[str, Any]) -> PriceBreakdown:
         subtotal = int(cart.get("subtotal") or 0)
         total = int(cart.get("total") or 0)
+        original_total = int(cart.get("totalBeforeDiscountsAndCredits") or 0)
         delivery_cents = _money_cents(_line_item(cart, "DELIVERY_FEE"))
-        discounts = _money_cents(_line_item(cart, "PROMOTION_DISCOUNT"))
-        fees_tax = max(total + discounts - subtotal - delivery_cents, 0)
+        discounts = max(original_total - total, 0)
+        fees_tax = max(total - subtotal - delivery_cents, 0)
 
         def fmt(cents: int) -> str:
             return f"${cents / 100:.2f}"
 
-        discount_display = f"-{fmt(discounts)}" if discounts else fmt(0)
+        discount_display = f"-{fmt(discounts)}" if discounts else ""
 
         return cls(
             subtotal_cents=subtotal,
@@ -171,6 +172,22 @@ class PriceBreakdown:
             discounts_display=discount_display,
             total_display=fmt(total),
         )
+
+
+def summarize_order_items_detail(cart: dict[str, Any]) -> list[dict]:
+    """Like summarize_order_items but includes imageUrl."""
+    seen: dict[str, dict] = {}
+    for order in cart.get("orders") or []:
+        for oi in order.get("orderItems") or []:
+            item = oi.get("item") or {}
+            name = item.get("name") or "Item"
+            qty  = int(oi.get("quantity") or 1)
+            img  = item.get("imageUrl") or ""
+            if name in seen:
+                seen[name]["qty"] += qty
+            else:
+                seen[name] = {"name": name, "qty": qty, "img": img}
+    return list(seen.values())
 
 
 def summarize_order_items(cart: dict[str, Any]) -> list[tuple[str, int]]:

@@ -20,6 +20,7 @@ query checkout($orderCartId: ID!, $shouldApplyCredits: Boolean) {
         quantity
         item {
           name
+          imageUrl
           __typename
         }
         __typename
