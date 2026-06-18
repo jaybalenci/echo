@@ -13,11 +13,11 @@ from core.account_pool import acquire
 from core.logger import log
 from doordash.address import set_delivery_address
 from doordash.cart_extract import extract_cart_items
-from doordash.checkout import PriceBreakdown, apply_promo_code, fetch_checkout, summarize_order_items, summarize_order_items_detail
+from doordash.checkout import PriceBreakdown, apply_promo_code, calc_tip_cents, fetch_checkout, summarize_order_items, summarize_order_items_detail
 from doordash.group_order import join_group_order
 from doordash.rebuild import rebuild_cart, schedule_cart_cleanup
-from doordash.web_client import DoorDashWebSession, store_referer
-from views.order_views import PriceBreakdownFields
+from doordash.web_client import DoorDashWebSession, resolve_csrf, store_referer
+from core.pricing import PriceBreakdownFields
 
 
 def _warm_and_set_address(
@@ -47,6 +47,7 @@ class PriceOrderResult:
     pricing: PriceBreakdownFields
     cart_id: str
     failures: list[str]
+    tip_error: str | None = None
     cleanup_fn: Callable[[], None] | None = field(default=None, repr=False)
 
 
@@ -54,10 +55,12 @@ def run_price_order(
     order_link: str,
     address: str,
     *,
+    prefetched_source_cart: dict | None = None,
     on_item_added: Callable[[list[str]], None] | None = None,
     on_status: Callable[[str], None] | None = None,
     on_info: Callable[[str, str], None] | None = None,
     promo_code: str = "YOUGOT40",
+    tip_str: str = "none",
 ) -> PriceOrderResult:
     def _status(msg: str) -> None:
         if on_status:
@@ -77,110 +80,170 @@ def run_price_order(
             _status("Checking order...")
             pre_client = DoorDashWebSession(cookies)
 
-            # Phase 1: warm+resolve address and fetch group order at the same time.
-            # Both callbacks fire from their worker threads the moment each result is
-            # ready — they don't wait for the other future to finish.
-            log("price", "phase 1: group order + session warm + address...")
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                f_setup = pool.submit(
-                    _warm_and_set_address, pre_client, address,
-                    on_address=lambda addr: _info("address", addr),
-                )
-
-                def _on_join_done(fut: Any) -> None:
-                    try:
-                        _, _, sc = fut.result()
-                        name = (sc.get("restaurant") or {}).get("name") or ""
-                        if name:
-                            _info("store", name)
-                    except Exception:
-                        pass
-
-                f_join = pool.submit(join_group_order, cookies, order_link)
-                f_join.add_done_callback(_on_join_done)
-
-            try:
-                address_result = f_setup.result()
-            except RequestException as exc:
-                if "403" in str(exc):
-                    log("price", f"address blocked 403 (account {idx + 1}), retrying...")
-                    failures += 1
-                    tried.add(idx)
-                    continue
-                raise
-
-            default_address = (address_result.get("default_address") or {})
-            printable_address = default_address.get("printableAddress") or address
-
-            # Join retry loop — address is already done so timeouts only redo the join.
-            # 403 still switches account (address would need a new session anyway).
             _switch_account = False
-            _join_try = 0
-            while True:
+
+            if prefetched_source_cart is not None:
+                # ── Fast path: cart pre-loaded, run address + rebuild in parallel ──
+                source_cart = prefetched_source_cart
+                specs = extract_cart_items(source_cart)
+                if not specs:
+                    raise RuntimeError("That cart has no items to rebuild.")
+                restaurant = source_cart.get("restaurant") or {}
+                menu_id = str((source_cart.get("menu") or {}).get("id") or "")
+                log("price", f"phase 1: warming (pre-loaded: {restaurant.get('name', '?')}, {len(specs)} item(s))...")
+
                 try:
-                    if _join_try == 0:
-                        cart_id, _, source_cart = f_join.result()
-                    else:
-                        log("price", f"retrying join (attempt {_join_try + 1})...")
-                        cart_id, _, source_cart = join_group_order(cookies, order_link)
-                    break
-                except (RuntimeError, RequestException) as exc:
+                    pre_client.warm("https://www.doordash.com/")
+                except RequestException as exc:
                     exc_str = str(exc)
-                    if "timed out" in exc_str.lower() or "curl: (28)" in exc_str:
-                        failures += 1
-                        _join_try += 1
-                        log("price", f"join timed out (account {idx + 1}), retrying join only...")
-                        if failures >= 3:
-                            _switch_account = True
-                            tried.add(idx)
-                            break
-                        continue
-                    if "403" in exc_str:
-                        log("price", f"join blocked 403 (account {idx + 1}), switching account...")
+                    if "403" in exc_str or "curl: (56)" in exc_str or "503" in exc_str:
+                        log("price", f"warm blocked (account {idx + 1}), retrying...")
                         failures += 1
                         tried.add(idx)
-                        _switch_account = True
-                        break
+                        continue
+                    raise
+                warmed_cookies = dict(pre_client.cookies)
+
+                log("price", f"phase 2: address + rebuild in parallel ({len(specs)} item(s))...")
+
+                def _do_address() -> dict[str, Any]:
+                    c = DoorDashWebSession(dict(warmed_cookies))
+                    c.csrf = resolve_csrf(c.cookies)
+                    c.cookies["csrf_token"] = c.csrf
+                    return set_delivery_address(c, address, referer="https://www.doordash.com/")
+
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    f_addr = pool.submit(_do_address)
+                    f_rebuild = pool.submit(
+                        rebuild_cart,
+                        specs, restaurant, menu_id, dict(warmed_cookies),
+                        on_item_added=on_item_added,
+                        on_status=on_status,
+                    )
+
+                try:
+                    address_result = f_addr.result()
+                except RequestException as exc:
+                    if "403" in str(exc):
+                        log("price", f"address blocked 403 (account {idx + 1}), retrying...")
+                        failures += 1
+                        tried.add(idx)
+                        continue
                     raise
 
-            if _switch_account:
-                continue
+                default_address = (address_result.get("default_address") or {})
+                printable_address = default_address.get("printableAddress") or address
+                _info("address", printable_address)
 
-            specs = extract_cart_items(source_cart)
-            if not specs:
-                raise RuntimeError("That cart has no items to rebuild.")
+                try:
+                    rebuilt, item_failures, client, built_cart_id = f_rebuild.result()
+                except RequestException as exc:
+                    exc_str = str(exc)
+                    if "timed out" in exc_str.lower() or "curl: (28)" in exc_str or "curl: (56)" in exc_str or "503" in exc_str or "403" in exc_str:
+                        log("price", f"rebuild failed (account {idx + 1}), retrying...")
+                        failures += 1
+                        tried.add(idx)
+                        continue
+                    raise
 
-            restaurant = source_cart.get("restaurant") or {}
-            menu_id = str((source_cart.get("menu") or {}).get("id") or "")
-            log("price", f"✓ group order → {restaurant.get('name', '?')} ({len(specs)} item(s))")
+            else:
+                # ── Standard path: warm+address parallel with join, then rebuild ──
+                log("price", "phase 1: group order + session warm + address...")
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    f_setup = pool.submit(
+                        _warm_and_set_address, pre_client, address,
+                        on_address=lambda addr: _info("address", addr),
+                    )
 
-            # Phase 2: rebuild cart only — address is already resolved from Phase 1.
-            # Pass warmed cookies (CSRF already set) so rebuild skips its own warm.
-            log("price", f"phase 2: building cart ({len(specs)} items)...")
-            warmed_cookies = dict(pre_client.cookies)
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                f_rebuild = pool.submit(
-                    rebuild_cart,
-                    specs, restaurant, menu_id, warmed_cookies,
-                    on_item_added=on_item_added,
-                    on_status=on_status,
-                )
+                    def _on_join_done(fut: Any) -> None:
+                        try:
+                            _, _, sc = fut.result()
+                            name = (sc.get("restaurant") or {}).get("name") or ""
+                            if name:
+                                _info("store", name)
+                        except Exception:
+                            pass
 
-            try:
-                rebuilt, item_failures, client, built_cart_id = f_rebuild.result()
-            except RequestException as exc:
-                exc_str = str(exc)
-                if "timed out" in exc_str.lower() or "curl: (28)" in exc_str:
-                    log("price", f"rebuild timed out (account {idx + 1}), retrying...")
-                    failures += 1
-                    tried.add(idx)
+                    f_join = pool.submit(join_group_order, cookies, order_link)
+                    f_join.add_done_callback(_on_join_done)
+
+                try:
+                    address_result = f_setup.result()
+                except RequestException as exc:
+                    if "403" in str(exc):
+                        log("price", f"address blocked 403 (account {idx + 1}), retrying...")
+                        failures += 1
+                        tried.add(idx)
+                        continue
+                    raise
+
+                default_address = (address_result.get("default_address") or {})
+                printable_address = default_address.get("printableAddress") or address
+
+                _join_try = 0
+                while True:
+                    try:
+                        if _join_try == 0:
+                            cart_id, _, source_cart = f_join.result()
+                        else:
+                            log("price", f"retrying join (attempt {_join_try + 1})...")
+                            cart_id, _, source_cart = join_group_order(cookies, order_link)
+                        break
+                    except (RuntimeError, RequestException) as exc:
+                        exc_str = str(exc)
+                        if "timed out" in exc_str.lower() or "curl: (28)" in exc_str or "curl: (56)" in exc_str or "503" in exc_str:
+                            failures += 1
+                            _join_try += 1
+                            log("price", f"join timed out (account {idx + 1}), retrying join only...")
+                            if failures >= 3:
+                                _switch_account = True
+                                tried.add(idx)
+                                break
+                            continue
+                        if "403" in exc_str:
+                            log("price", f"join blocked 403 (account {idx + 1}), switching account...")
+                            failures += 1
+                            tried.add(idx)
+                            _switch_account = True
+                            break
+                        raise
+
+                if _switch_account:
                     continue
-                if "403" in exc_str:
-                    log("price", f"rebuild blocked 403 (account {idx + 1}), retrying...")
-                    failures += 1
-                    tried.add(idx)
-                    continue
-                raise
+
+                specs = extract_cart_items(source_cart)
+                if not specs:
+                    raise RuntimeError("That cart has no items to rebuild.")
+
+                restaurant = source_cart.get("restaurant") or {}
+                menu_id = str((source_cart.get("menu") or {}).get("id") or "")
+                log("price", f"✓ group order → {restaurant.get('name', '?')} ({len(specs)} item(s))")
+
+                log("price", f"phase 2: building cart ({len(specs)} items)...")
+                warmed_cookies = dict(pre_client.cookies)
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    f_rebuild = pool.submit(
+                        rebuild_cart,
+                        specs, restaurant, menu_id, warmed_cookies,
+                        on_item_added=on_item_added,
+                        on_status=on_status,
+                    )
+
+                try:
+                    rebuilt, item_failures, client, built_cart_id = f_rebuild.result()
+                except RequestException as exc:
+                    exc_str = str(exc)
+                    if "timed out" in exc_str.lower() or "curl: (28)" in exc_str or "curl: (56)" in exc_str or "503" in exc_str:
+                        log("price", f"rebuild timed out (account {idx + 1}), retrying...")
+                        failures += 1
+                        tried.add(idx)
+                        continue
+                    if "403" in exc_str:
+                        log("price", f"rebuild blocked 403 (account {idx + 1}), retrying...")
+                        failures += 1
+                        tried.add(idx)
+                        continue
+                    raise
 
             if not built_cart_id:
                 if item_failures:
@@ -190,12 +253,22 @@ def run_price_order(
                     "The cart appears to be empty. Make sure the group order has items before price-checking."
                 )
 
+            rebuilt_subtotal_cents = int(rebuilt.get("subtotal") or 0)
+            if rebuilt_subtotal_cents < 1500 or rebuilt_subtotal_cents > 2500:
+                raise RuntimeError(
+                    f"Subtotal exceeded (${rebuilt_subtotal_cents / 100:.2f}). "
+                    "Cart must be between $15.00 and $25.00."
+                )
+
             lat = float(default_address.get("lat") or 0)
             lng = float(default_address.get("lng") or 0)
 
             if promo_code and promo_code != "Not Set":
                 _status("Applying promotion...")
                 apply_promo_code(client, built_cart_id, promo_code, lat=lat, lng=lng)
+
+            tip_cents = calc_tip_cents(tip_str, int(rebuilt.get("subtotal") or 0))
+            tip_error: str | None = None
 
             _checkout_try = 0
             while True:
@@ -204,7 +277,7 @@ def run_price_order(
                     break
                 except RequestException as exc:
                     exc_str = str(exc)
-                    if "timed out" in exc_str.lower() or "curl: (28)" in exc_str:
+                    if "timed out" in exc_str.lower() or "curl: (28)" in exc_str or "curl: (56)" in exc_str or "503" in exc_str:
                         failures += 1
                         _checkout_try += 1
                         log("price", f"checkout timed out (account {idx + 1}), retrying...")
@@ -232,12 +305,18 @@ def run_price_order(
         if not items_detail and rebuilt:
             items_detail = summarize_order_items_detail(rebuilt)
 
+        # Total = arithmetic sum of displayed components — always consistent.
+        # Original (strikethrough) = same without the promo discount.
+        total_with_tip = breakdown.subtotal_cents + breakdown.fees_tax_cents + breakdown.delivery_cents - breakdown.discounts_cents + tip_cents
+        original_with_tip = (breakdown.subtotal_cents + breakdown.fees_tax_cents + breakdown.delivery_cents + tip_cents) if breakdown.discounts_cents else 0
         pricing = PriceBreakdownFields(
             subtotal_display=breakdown.subtotal_display,
             fees_tax_display=breakdown.fees_tax_display,
             delivery_fee_display=breakdown.delivery_fee_display,
             discounts_display=breakdown.discounts_display,
-            total_display=breakdown.total_display,
+            tip_display=f"${tip_cents / 100:.2f}" if tip_cents else "",
+            total_display=f"${total_with_tip / 100:.2f}",
+            original_total_display=f"${original_with_tip / 100:.2f}" if original_with_tip else "",
         )
 
         # Capture cleanup args in a closure — called by main.py AFTER the price
@@ -252,5 +331,6 @@ def run_price_order(
             pricing=pricing,
             cart_id=built_cart_id,
             failures=item_failures,
+            tip_error=tip_error,
             cleanup_fn=lambda: schedule_cart_cleanup(_client, _cart_id, _rebuilt, _referer),
         )
