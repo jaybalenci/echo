@@ -1,24 +1,7 @@
-# Secrets — never commit these
 .env
-.env.*
-config/
-
-# Python cache
+config/doordash_cookies.txt
+config/doordash_build_cookies.txt
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-
-# Virtual environments
-venv/
-env/
+*.py[cod]
 .venv/
-
-# Claude Code
-.claude/
-
-# Dev/test utilities
-test_accounts.py
-nuke_acct4.py
-*.png
+venv/

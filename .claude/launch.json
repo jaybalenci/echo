@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "canary-webapp",
-      "runtimeExecutable": "npx",
-      "runtimeArgs": ["serve", "webapp", "-p", "3000", "--no-clipboard"],
+      "runtimeExecutable": "C:\\Users\\jason\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
+      "runtimeArgs": ["C:\\Users\\jason\\Documents\\telegram bot\\server.py"],
       "port": 3000
     }
   ]
